@@ -1,0 +1,938 @@
+/* Author:  Demiyan Dissanayake <demiyandissanayake@gmail.com>
+ * Project: MiniKV - https://github.com/Dexel-Software-Solutions
+ * License: MIT (see LICENSE)
+ */
+/* MiniKV - a small Redis-compatible in-memory key-value server.
+ *
+ * Architecture (single-threaded, like Redis):
+ *   epoll (level-triggered) -> per-connection read buffer -> zero-copy RESP
+ *   parser -> command table -> dict. Replies are buffered per connection and
+ *   flushed once per event-loop iteration AFTER the AOF has been written (and
+ *   fsynced when policy = always), so an acknowledged write is always durable.
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/epoll.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "dict.h"
+#include "resp.h"
+
+#define VERSION "0.1.0"
+#define MAX_EVENTS 512
+#define IO_CHUNK 16384
+#define MAX_QUERYBUF (128u * 1024 * 1024) /* per-client input cap */
+#define MAX_OUTBUF (64u * 1024 * 1024)    /* per-client unread-output cap */
+#define SHRINK_AT (64u * 1024)
+#define EXPIRE_SAMPLE_BUCKETS 20
+#define EXPIRE_MAX_ROUNDS 16
+
+enum { FSYNC_NO, FSYNC_EVERYSEC, FSYNC_ALWAYS };
+
+typedef struct conn {
+    int fd;
+    char *rbuf;
+    size_t rlen, rcap;
+    char *wbuf;
+    size_t wlen, wpos, wcap;
+    unsigned queued : 1;            /* in the pending-flush list */
+    unsigned epollout : 1;          /* EPOLLOUT currently registered */
+    unsigned close_after_write : 1; /* QUIT / protocol error */
+    unsigned dead : 1;              /* close at next safe point */
+} conn;
+
+static struct {
+    int epfd, listenfd, port;
+    dict *db;
+    dict *expires; /* index of keys that have a TTL (see set_expire) */
+    conn **conns; /* indexed by fd */
+    size_t conns_cap;
+    int *pending; /* fds with unflushed replies */
+    size_t npending, pending_cap;
+    volatile sig_atomic_t stop;
+
+    long long now; /* cached wall-clock ms, refreshed per loop iteration */
+
+    int aof_fd, fsync_policy, loading, aof_dirty;
+    char *aof_path;
+    char *aof_buf;
+    size_t aof_len, aof_cap;
+    long long last_fsync; /* monotonic ms */
+
+    long long start_ms, total_cmds, total_conns;
+    long clients;
+} S = {.aof_fd = -1, .fsync_policy = FSYNC_EVERYSEC, .port = 6399};
+
+static rcmd g_cmd; /* 16 KB: kept off the stack */
+
+/* ------------------------------------------------------------------ utils */
+
+__attribute__((format(printf, 2, 3))) static void logmsg(const char *lvl,
+                                                         const char *fmt, ...) {
+    char ts[16];
+    time_t t = time(NULL);
+    struct tm tm;
+    va_list ap;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+    fprintf(stderr, "%s [%s] ", ts, lvl);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+#define LOG(...) logmsg("I", __VA_ARGS__)
+#define WARN(...) logmsg("W", __VA_ARGS__)
+#define DIE(...)                  \
+    do {                          \
+        logmsg("E", __VA_ARGS__); \
+        exit(1);                  \
+    } while (0)
+
+static long long wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static long long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int reserve(char **buf, size_t *cap, size_t need) {
+    size_t nc = *cap ? *cap : 1024;
+    char *nb;
+    if (need <= *cap) return 0;
+    while (nc < need) {
+        if (nc > SIZE_MAX / 2) return -1;
+        nc *= 2;
+    }
+    nb = realloc(*buf, nc);
+    if (!nb) return -1;
+    *buf = nb;
+    *cap = nc;
+    return 0;
+}
+
+static int arg_ieq(rarg a, const char *s) {
+    size_t n = strlen(s);
+    return a.n == n && strncasecmp(a.p, s, n) == 0;
+}
+
+/* Strict int64 parse (no spaces, no trailing garbage, overflow-checked). */
+static int parse_i64(const char *s, size_t n, long long *out) {
+    unsigned long long acc = 0;
+    size_t i = 0;
+    int neg = 0;
+    if (n == 0 || n > 20) return -1;
+    if (s[0] == '-') {
+        neg = 1;
+        i = 1;
+        if (n == 1) return -1;
+    }
+    for (; i < n; i++) {
+        unsigned d;
+        if (s[i] < '0' || s[i] > '9') return -1;
+        d = (unsigned)(s[i] - '0');
+        if (acc > (ULLONG_MAX - d) / 10) return -1;
+        acc = acc * 10 + d;
+    }
+    if (neg) {
+        if (acc > (unsigned long long)LLONG_MAX + 1ULL) return -1;
+        *out = (acc == (unsigned long long)LLONG_MAX + 1ULL) ? LLONG_MIN
+                                                              : -(long long)acc;
+    } else {
+        if (acc > (unsigned long long)LLONG_MAX) return -1;
+        *out = (long long)acc;
+    }
+    return 0;
+}
+
+/* '*' and '?' only. Iterative with single backtrack point: O(n*m) worst case,
+ * no exponential blow-up on hostile patterns. */
+static int glob_match(const char *p, size_t pn, const char *s, size_t sn) {
+    size_t pi = 0, si = 0, star = (size_t)-1, mark = 0;
+    while (si < sn) {
+        if (pi < pn && p[pi] == '*') {
+            star = pi++;
+            mark = si;
+        } else if (pi < pn && (p[pi] == '?' || p[pi] == s[si])) {
+            pi++;
+            si++;
+        } else if (star != (size_t)-1) {
+            pi = star + 1;
+            si = ++mark;
+        } else {
+            return 0;
+        }
+    }
+    while (pi < pn && p[pi] == '*') pi++;
+    return pi == pn;
+}
+
+/* ------------------------------------------------------------ connections */
+
+static void queue_flush(conn *c) {
+    if (c->queued) return;
+    if (S.npending == S.pending_cap) {
+        size_t nc = S.pending_cap ? S.pending_cap * 2 : 256;
+        int *np = realloc(S.pending, nc * sizeof *np);
+        if (!np) {
+            c->dead = 1;
+            return;
+        }
+        S.pending = np;
+        S.pending_cap = nc;
+    }
+    c->queued = 1;
+    S.pending[S.npending++] = c->fd;
+}
+
+/* All reply helpers accept c == NULL (AOF replay: replies are discarded). */
+static void wr(conn *c, const void *p, size_t n) {
+    if (!c || c->dead) return;
+    if (c->wlen - c->wpos + n > MAX_OUTBUF) { /* client not reading: drop it */
+        c->dead = 1;
+        return;
+    }
+    if (reserve(&c->wbuf, &c->wcap, c->wlen + n) < 0) {
+        c->dead = 1;
+        return;
+    }
+    memcpy(c->wbuf + c->wlen, p, n);
+    c->wlen += n;
+    queue_flush(c);
+}
+static void add_raw(conn *c, const char *s) { wr(c, s, strlen(s)); }
+static void add_ok(conn *c) { add_raw(c, "+OK\r\n"); }
+static void add_err(conn *c, const char *msg) {
+    add_raw(c, "-");
+    add_raw(c, msg);
+    add_raw(c, "\r\n");
+}
+static void add_int(conn *c, long long v) {
+    char b[32];
+    int n = snprintf(b, sizeof b, ":%lld\r\n", v);
+    wr(c, b, (size_t)n);
+}
+static void add_arr(conn *c, size_t n) {
+    char b[32];
+    int l = snprintf(b, sizeof b, "*%zu\r\n", n);
+    wr(c, b, (size_t)l);
+}
+static void add_null(conn *c) { add_raw(c, "$-1\r\n"); }
+static void add_bulk(conn *c, const char *p, size_t n) {
+    char b[32];
+    int l = snprintf(b, sizeof b, "$%zu\r\n", n);
+    wr(c, b, (size_t)l);
+    wr(c, p, n);
+    wr(c, "\r\n", 2);
+}
+
+static void close_conn(conn *c) {
+    epoll_ctl(S.epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    S.conns[c->fd] = NULL;
+    S.clients--;
+    free(c->rbuf);
+    free(c->wbuf);
+    free(c);
+}
+
+static void set_epollout(conn *c, int on) {
+    struct epoll_event ev = {.events = EPOLLIN | (on ? EPOLLOUT : 0),
+                             .data.fd = c->fd};
+    if (epoll_ctl(S.epfd, EPOLL_CTL_MOD, c->fd, &ev) == 0) c->epollout = on;
+}
+
+/* Try to send everything; register EPOLLOUT only if the kernel buffer is full.
+ * This is the "partial write" path most hand-rolled servers get wrong. */
+static void flush_conn(conn *c) {
+    while (c->wpos < c->wlen) {
+        ssize_t n = send(c->fd, c->wbuf + c->wpos, c->wlen - c->wpos, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            c->dead = 1;
+            return;
+        }
+        c->wpos += (size_t)n;
+    }
+    if (c->wpos == c->wlen) {
+        c->wpos = c->wlen = 0;
+        if (c->wcap > SHRINK_AT) {
+            free(c->wbuf);
+            c->wbuf = NULL;
+            c->wcap = 0;
+        }
+        if (c->epollout) set_epollout(c, 0);
+        if (c->close_after_write) c->dead = 1;
+    } else if (!c->epollout) {
+        set_epollout(c, 1);
+    }
+}
+
+/* ------------------------------------------------------------------- AOF */
+
+static void aof_append_raw(const void *p, size_t n) {
+    if (reserve(&S.aof_buf, &S.aof_cap, S.aof_len + n) < 0) DIE("out of memory (AOF buffer)");
+    memcpy(S.aof_buf + S.aof_len, p, n);
+    S.aof_len += n;
+}
+
+/* Serialize a command in RESP into the in-memory AOF buffer. */
+static void aof_feed(int argc, const rarg *argv) {
+    char h[32];
+    int l;
+    if (S.loading || S.aof_fd < 0) return;
+    l = snprintf(h, sizeof h, "*%d\r\n", argc);
+    aof_append_raw(h, (size_t)l);
+    for (int i = 0; i < argc; i++) {
+        l = snprintf(h, sizeof h, "$%zu\r\n", argv[i].n);
+        aof_append_raw(h, (size_t)l);
+        aof_append_raw(argv[i].p, argv[i].n);
+        aof_append_raw("\r\n", 2);
+    }
+}
+
+/* write() the buffer, then fsync according to policy. Called once per loop
+ * iteration BEFORE replies are flushed. */
+static void aof_flush(int force_sync) {
+    if (S.aof_fd < 0) return;
+    if (S.aof_len) {
+        size_t off = 0;
+        while (off < S.aof_len) {
+            ssize_t n = write(S.aof_fd, S.aof_buf + off, S.aof_len - off);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                DIE("AOF write failed: %s (refusing to continue with lost durability)",
+                    strerror(errno));
+            }
+            off += (size_t)n;
+        }
+        S.aof_len = 0;
+        S.aof_dirty = 1;
+        if (S.aof_cap > (1u << 20)) {
+            free(S.aof_buf);
+            S.aof_buf = NULL;
+            S.aof_cap = 0;
+        }
+    }
+    if (S.aof_dirty) {
+        long long m = mono_ms();
+        if (force_sync || S.fsync_policy == FSYNC_ALWAYS ||
+            (S.fsync_policy == FSYNC_EVERYSEC && m - S.last_fsync >= 1000)) {
+            if (fdatasync(S.aof_fd) < 0) DIE("fdatasync failed: %s", strerror(errno));
+            S.last_fsync = m;
+            S.aof_dirty = 0;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- commands */
+
+typedef void (*cmd_fn)(conn *c, int argc, rarg *argv);
+
+/* Lookup honoring lazy expiration. */
+static entry *db_lookup(rarg k) {
+    entry *e = dict_find(S.db, k.p, k.n);
+    if (e && e->expire_at >= 0 && e->expire_at <= S.now) {
+        dict_delete_entry(S.db, e);
+        return NULL;
+    }
+    return e;
+}
+
+/* Secondary index of keys that carry a TTL. Active expiry samples THIS dict
+ * instead of the main one, so its cost scales with the number of volatile keys
+ * rather than with the whole keyspace. Entries are removed LAZILY: a stale one
+ * (key deleted / TTL cleared) is dropped when sampled, so no delete path has to
+ * remember to update the index. */
+static void set_expire(entry *e, rarg key, long long abs_exp) {
+    e->expire_at = abs_exp;
+    if (abs_exp >= 0) (void)dict_set(S.expires, key.p, key.n, "", 0);
+}
+
+static void cmd_ping(conn *c, int argc, rarg *argv) {
+    if (argc > 2) { add_err(c, "ERR wrong number of arguments for 'ping' command"); return; }
+    if (argc == 2) { add_bulk(c, argv[1].p, argv[1].n); return; }
+    add_raw(c, "+PONG\r\n");
+}
+static void cmd_echo(conn *c, int argc, rarg *argv) { add_bulk(c, argv[1].p, argv[1].n); }
+
+static void cmd_set(conn *c, int argc, rarg *argv) {
+    long long abs_exp = -1;
+    for (int i = 3; i < argc; i++) {
+        int mult, absolute = 0;
+        long long v;
+        if (arg_ieq(argv[i], "EX")) mult = 1000;
+        else if (arg_ieq(argv[i], "PX")) mult = 1;
+        else if (arg_ieq(argv[i], "PXAT")) mult = 1, absolute = 1;
+        else { add_err(c, "ERR syntax error"); return; }
+        if (abs_exp != -1 || i + 1 >= argc) { add_err(c, "ERR syntax error"); return; }
+        if (parse_i64(argv[i + 1].p, argv[i + 1].n, &v) < 0)
+            { add_err(c, "ERR value is not an integer or out of range"); return; }
+        if (v <= 0 || v > (LLONG_MAX / 2) / mult)
+            { add_err(c, "ERR invalid expire time in 'set' command"); return; }
+        v *= mult;
+        abs_exp = absolute ? v : v + S.now;
+        i++;
+    }
+
+    if (abs_exp != -1 && abs_exp <= S.now) {
+        dict_delete(S.db, argv[1].p, argv[1].n); /* already expired */
+    } else {
+        entry *e = dict_set(S.db, argv[1].p, argv[1].n, argv[2].p, argv[2].n);
+        if (!e) { add_err(c, "OOM command not allowed (out of memory)"); return; }
+        set_expire(e, argv[1], abs_exp); /* plain SET (abs_exp = -1) clears any TTL */
+    }
+    add_ok(c);
+
+    /* Log with an ABSOLUTE deadline so replay after a restart is exact. */
+    {
+        rarg out[5] = {{"SET", 3}, argv[1], argv[2], {"PXAT", 4}, {NULL, 0}};
+        char num[24];
+        if (abs_exp != -1) {
+            out[4].n = (size_t)snprintf(num, sizeof num, "%lld", abs_exp);
+            out[4].p = num;
+            aof_feed(5, out);
+        } else {
+            aof_feed(3, out);
+        }
+    }
+}
+
+static void cmd_get(conn *c, int argc, rarg *argv) {
+    entry *e = db_lookup(argv[1]);
+    if (!e) { add_null(c); return; }
+    add_bulk(c, e->val, e->vlen);
+}
+
+static void cmd_del(conn *c, int argc, rarg *argv) {
+    long long n = 0;
+    for (int i = 1; i < argc; i++)
+        if (db_lookup(argv[i])) {
+            dict_delete(S.db, argv[i].p, argv[i].n);
+            n++;
+        }
+    add_int(c, n);
+    if (n) aof_feed(argc, argv);
+}
+
+static void cmd_exists(conn *c, int argc, rarg *argv) {
+    long long n = 0;
+    for (int i = 1; i < argc; i++) n += db_lookup(argv[i]) != NULL;
+    add_int(c, n);
+}
+
+static void incr_generic(conn *c, int argc, rarg *argv, long long delta) {
+    entry *e = db_lookup(argv[1]);
+    long long cur = 0, nv;
+    char buf[24];
+    int n;
+    if (e && parse_i64(e->val, e->vlen, &cur) < 0)
+        { add_err(c, "ERR value is not an integer or out of range"); return; }
+    if (__builtin_add_overflow(cur, delta, &nv))
+        { add_err(c, "ERR increment or decrement would overflow"); return; }
+    n = snprintf(buf, sizeof buf, "%lld", nv);
+    if (!dict_set(S.db, argv[1].p, argv[1].n, buf, (size_t)n))
+        { add_err(c, "OOM command not allowed (out of memory)"); return; }
+    add_int(c, nv);
+    aof_feed(argc, argv); /* deterministic: replay re-applies INCR in order */
+}
+static void cmd_incr(conn *c, int argc, rarg *argv) { incr_generic(c, argc, argv, 1); }
+static void cmd_decr(conn *c, int argc, rarg *argv) { incr_generic(c, argc, argv, -1); }
+
+static void expire_generic(conn *c, rarg *argv, long long mult, int absolute) {
+    long long v, abs_exp;
+    entry *e;
+    if (parse_i64(argv[2].p, argv[2].n, &v) < 0)
+        { add_err(c, "ERR value is not an integer or out of range"); return; }
+    if (v > (LLONG_MAX / 2) / mult || v < -(LLONG_MAX / 2) / mult)
+        { add_err(c, "ERR invalid expire time"); return; }
+    abs_exp = absolute ? v * mult : S.now + v * mult;
+    e = db_lookup(argv[1]);
+    if (!e) { add_int(c, 0); return; }
+
+    if (abs_exp <= S.now) dict_delete_entry(S.db, e);
+    else set_expire(e, argv[1], abs_exp);
+    add_int(c, 1);
+    {
+        char num[24];
+        rarg out[3] = {{"PEXPIREAT", 9}, argv[1], {num, 0}};
+        out[2].n = (size_t)snprintf(num, sizeof num, "%lld", abs_exp);
+        aof_feed(3, out);
+    }
+}
+static void cmd_expire(conn *c, int argc, rarg *argv) { expire_generic(c, argv, 1000, 0); }
+static void cmd_pexpire(conn *c, int argc, rarg *argv) { expire_generic(c, argv, 1, 0); }
+static void cmd_expireat(conn *c, int argc, rarg *argv) { expire_generic(c, argv, 1000, 1); }
+static void cmd_pexpireat(conn *c, int argc, rarg *argv) { expire_generic(c, argv, 1, 1); }
+
+static void ttl_generic(conn *c, rarg *argv, int ms) {
+    entry *e = db_lookup(argv[1]);
+    long long left;
+    if (!e) { add_int(c, -2); return; }
+    if (e->expire_at < 0) { add_int(c, -1); return; }
+    left = e->expire_at - S.now;
+    add_int(c, ms ? left : (left + 500) / 1000);
+}
+static void cmd_ttl(conn *c, int argc, rarg *argv) { ttl_generic(c, argv, 0); }
+static void cmd_pttl(conn *c, int argc, rarg *argv) { ttl_generic(c, argv, 1); }
+
+static void cmd_persist(conn *c, int argc, rarg *argv) {
+    entry *e = db_lookup(argv[1]);
+    if (!e || e->expire_at < 0) { add_int(c, 0); return; }
+    e->expire_at = -1;
+    add_int(c, 1);
+    aof_feed(argc, argv);
+}
+
+static void cmd_dbsize(conn *c, int argc, rarg *argv) { add_int(c, (long long)dict_size(S.db)); }
+
+typedef struct {
+    conn *c;
+    const char *pat;
+    size_t plen;
+    int emit;
+    size_t count;
+} keys_ctx;
+
+static void keys_cb(entry *e, void *p) {
+    keys_ctx *k = p;
+    if (e->expire_at >= 0 && e->expire_at <= S.now) return;
+    if (!glob_match(k->pat, k->plen, e->key, e->klen)) return;
+    if (k->emit) add_bulk(k->c, e->key, e->klen);
+    k->count++;
+}
+
+/* O(N) and blocks the loop - same caveat as Redis. A cursor-based SCAN is on
+ * the roadmap. */
+static void cmd_keys(conn *c, int argc, rarg *argv) {
+    keys_ctx k = {c, argv[1].p, argv[1].n, 0, 0};
+    dict_foreach(S.db, keys_cb, &k);
+    add_arr(c, k.count);
+    k.emit = 1;
+    dict_foreach(S.db, keys_cb, &k);
+}
+
+static void cmd_flushall(conn *c, int argc, rarg *argv) {
+    dict_clear(S.db);
+    dict_clear(S.expires);
+    add_ok(c);
+    aof_feed(argc, argv);
+}
+
+static void cmd_info(conn *c, int argc, rarg *argv) {
+    char b[768];
+    int n = snprintf(b, sizeof b,
+                     "# Server\r\nminikv_version:" VERSION "\r\ntcp_port:%d\r\n"
+                     "uptime_in_seconds:%lld\r\n# Clients\r\nconnected_clients:%ld\r\n"
+                     "# Stats\r\ntotal_connections_received:%lld\r\n"
+                     "total_commands_processed:%lld\r\n# Persistence\r\n"
+                     "aof_enabled:%d\r\naof_fsync:%s\r\n# Keyspace\r\ndb0:keys=%zu\r\n",
+                     S.port, (wall_ms() - S.start_ms) / 1000, S.clients, S.total_conns,
+                     S.total_cmds, S.aof_fd >= 0,
+                     S.fsync_policy == FSYNC_ALWAYS     ? "always"
+                     : S.fsync_policy == FSYNC_EVERYSEC ? "everysec"
+                                                        : "no",
+                     dict_size(S.db));
+    add_bulk(c, b, (size_t)n);
+}
+
+/* redis-cli / redis-benchmark probe these on connect. */
+static void cmd_empty_array(conn *c, int argc, rarg *argv) { add_raw(c, "*0\r\n"); }
+static void cmd_select(conn *c, int argc, rarg *argv) {
+    if (argv[1].n == 1 && argv[1].p[0] == '0') add_ok(c);
+    else add_err(c, "ERR DB index is out of range (MiniKV has a single database)");
+}
+static void cmd_quit(conn *c, int argc, rarg *argv) {
+    add_ok(c);
+    if (c) c->close_after_write = 1;
+}
+
+typedef struct {
+    const char *name;
+    cmd_fn fn;
+    int arity; /* >0 exact, <0 minimum (abs), counts the command name */
+} cmd_def;
+
+static const cmd_def commands[] = {
+    {"PING", cmd_ping, -1},       {"ECHO", cmd_echo, 2},
+    {"SET", cmd_set, -3},         {"GET", cmd_get, 2},
+    {"DEL", cmd_del, -2},         {"EXISTS", cmd_exists, -2},
+    {"INCR", cmd_incr, 2},        {"DECR", cmd_decr, 2},
+    {"EXPIRE", cmd_expire, 3},    {"PEXPIRE", cmd_pexpire, 3},
+    {"EXPIREAT", cmd_expireat, 3}, {"PEXPIREAT", cmd_pexpireat, 3},
+    {"TTL", cmd_ttl, 2},          {"PTTL", cmd_pttl, 2},
+    {"PERSIST", cmd_persist, 2},  {"DBSIZE", cmd_dbsize, 1},
+    {"KEYS", cmd_keys, 2},        {"FLUSHALL", cmd_flushall, -1},
+    {"INFO", cmd_info, -1},       {"COMMAND", cmd_empty_array, -1},
+    {"CONFIG", cmd_empty_array, -1}, {"SELECT", cmd_select, 2},
+    {"QUIT", cmd_quit, -1},       {NULL, NULL, 0}};
+
+static void execute(conn *c, const rcmd *cmd) {
+    rarg *a = (rarg *)cmd->argv;
+    if (cmd->argc == 0) return;
+    for (const cmd_def *d = commands; d->name; d++) {
+        if (!arg_ieq(a[0], d->name)) continue;
+        if ((d->arity > 0 && cmd->argc != d->arity) ||
+            (d->arity < 0 && cmd->argc < -d->arity)) {
+            add_raw(c, "-ERR wrong number of arguments for '");
+            add_raw(c, d->name);
+            add_raw(c, "' command\r\n");
+            return;
+        }
+        S.total_cmds++;
+        d->fn(c, cmd->argc, a);
+        return;
+    }
+    {   /* Never echo raw client bytes into a reply: a name containing \r\n would
+         * let a client inject fake replies. Keep printable ASCII only. */
+        char name[48];
+        size_t n = a[0].n < sizeof name - 1 ? a[0].n : sizeof name - 1;
+        for (size_t i = 0; i < n; i++)
+            name[i] = (a[0].p[i] >= 32 && a[0].p[i] < 127) ? a[0].p[i] : '?';
+        name[n] = '\0';
+        add_raw(c, "-ERR unknown command '");
+        add_raw(c, name);
+        add_raw(c, "'\r\n");
+    }
+}
+
+/* ------------------------------------------------------------- AOF loading */
+
+static void aof_load(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    char *buf;
+    size_t size, off = 0, got = 0;
+    long long count = 0;
+
+    if (fd < 0) {
+        if (errno == ENOENT) return;
+        DIE("cannot open AOF %s: %s", path, strerror(errno));
+    }
+    if (fstat(fd, &st) < 0) DIE("fstat: %s", strerror(errno));
+    size = (size_t)st.st_size;
+    if (size == 0) {
+        close(fd);
+        return;
+    }
+    buf = malloc(size);
+    if (!buf) DIE("out of memory loading AOF (%zu bytes)", size);
+    while (got < size) {
+        ssize_t n = read(fd, buf + got, size - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) DIE("AOF read failed");
+        got += (size_t)n;
+    }
+    close(fd);
+
+    S.loading = 1;
+    S.now = wall_ms();
+    while (off < size) {
+        size_t used = 0;
+        const char *err = NULL;
+        int r = resp_parse(buf + off, size - off, &used, &g_cmd, &err);
+        if (r == RESP_INCOMPLETE) break;
+        if (r == RESP_ERR) DIE("AOF corrupted at offset %zu: %s", off, err);
+        off += used;
+        execute(NULL, &g_cmd);
+        count++;
+    }
+    S.loading = 0;
+    free(buf);
+
+    if (off < size) { /* torn final write (crash mid-append): drop the tail */
+        WARN("AOF has %zu bytes of incomplete trailing command; truncating", size - off);
+        if (truncate(path, (off_t)off) < 0) DIE("truncate AOF: %s", strerror(errno));
+    }
+    LOG("AOF loaded: %lld commands, %zu keys", count, dict_size(S.db));
+}
+
+/* -------------------------------------------------------------- event loop */
+
+static void process_input(conn *c) {
+    size_t off = 0;
+    S.now = wall_ms();
+    while (off < c->rlen && !c->dead && !c->close_after_write) {
+        size_t used = 0;
+        const char *err = NULL;
+        int r = resp_parse(c->rbuf + off, c->rlen - off, &used, &g_cmd, &err);
+        if (r == RESP_INCOMPLETE) break;
+        if (r == RESP_ERR) {
+            add_err(c, err);
+            c->close_after_write = 1;
+            break;
+        }
+        off += used;
+        execute(c, &g_cmd); /* args point into rbuf: don't touch rbuf until done */
+    }
+    if (off) {
+        memmove(c->rbuf, c->rbuf + off, c->rlen - off);
+        c->rlen -= off;
+    }
+    if (c->rlen == 0 && c->rcap > SHRINK_AT) {
+        free(c->rbuf);
+        c->rbuf = NULL;
+        c->rcap = 0;
+    }
+}
+
+static void on_readable(conn *c) {
+    ssize_t n;
+    if (reserve(&c->rbuf, &c->rcap, c->rlen + IO_CHUNK) < 0) { close_conn(c); return; }
+    n = read(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen);
+    if (n == 0) { close_conn(c); return; }
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+        { close_conn(c); return; }
+    }
+    c->rlen += (size_t)n;
+    if (c->rlen > MAX_QUERYBUF) {
+        WARN("client fd=%d exceeded query buffer limit, closing", c->fd);
+        { close_conn(c); return; }
+    }
+    process_input(c);
+    if (c->dead) close_conn(c);
+}
+
+static void accept_clients(void) {
+    for (;;) {
+        int fd = accept4(S.listenfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        struct epoll_event ev = {.events = EPOLLIN};
+        conn *c;
+        int one = 1;
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) WARN("accept: %s", strerror(errno));
+            return;
+        }
+        if ((size_t)fd >= S.conns_cap) {
+            size_t nc = S.conns_cap ? S.conns_cap : 1024;
+            conn **n;
+            while (nc <= (size_t)fd) nc *= 2;
+            n = realloc(S.conns, nc * sizeof *n);
+            if (!n) {
+                close(fd);
+                continue;
+            }
+            memset(n + S.conns_cap, 0, (nc - S.conns_cap) * sizeof *n);
+            S.conns = n;
+            S.conns_cap = nc;
+        }
+        c = calloc(1, sizeof *c);
+        if (!c) {
+            close(fd);
+            continue;
+        }
+        c->fd = fd;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        ev.data.fd = fd;
+        if (epoll_ctl(S.epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            close(fd);
+            free(c);
+            continue;
+        }
+        S.conns[fd] = c;
+        S.clients++;
+        S.total_conns++;
+    }
+}
+
+/* Active expiry (Redis-style): probabilistically sample random buckets of the
+ * TTL index; if >25% of what we looked at was reclaimable, sample again
+ * (bounded per tick). Keeps memory from filling with dead keys nobody reads
+ * without ever scanning the whole keyspace. */
+static void active_expire(void) {
+    S.now = wall_ms();
+    for (int round = 0; round < EXPIRE_MAX_ROUNDS; round++) {
+        int sampled = 0, reclaimed = 0;
+        for (int i = 0; i < EXPIRE_SAMPLE_BUCKETS; i++) {
+            entry *drop[32]; /* index entries to remove after walking the chain */
+            int nd = 0;
+            for (entry *ie = dict_random_bucket(S.expires); ie; ie = ie->next) {
+                entry *e = dict_find(S.db, ie->key, ie->klen);
+                sampled++;
+                if (!e || e->expire_at < 0) { /* stale index entry */
+                    if (nd < 32) drop[nd++] = ie;
+                    reclaimed++;
+                } else if (e->expire_at <= S.now) {
+                    dict_delete_entry(S.db, e);
+                    if (nd < 32) drop[nd++] = ie;
+                    reclaimed++;
+                }
+            }
+            for (int d = 0; d < nd; d++) dict_delete_entry(S.expires, drop[d]);
+        }
+        if (sampled == 0 || reclaimed * 4 <= sampled) break;
+    }
+}
+
+static void before_sleep(void) {
+    aof_flush(0);
+    for (size_t i = 0; i < S.npending; i++) {
+        conn *c = S.conns[S.pending[i]];
+        if (!c) continue; /* closed since it was queued */
+        c->queued = 0;
+        flush_conn(c);
+        if (c->dead) close_conn(c);
+    }
+    S.npending = 0;
+}
+
+static void event_loop(void) {
+    struct epoll_event evs[MAX_EVENTS];
+    long long last_expire = mono_ms();
+
+    while (!S.stop) {
+        int n = epoll_wait(S.epfd, evs, MAX_EVENTS, 100);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            DIE("epoll_wait: %s", strerror(errno));
+        }
+        for (int i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
+            uint32_t ev = evs[i].events;
+            conn *c;
+            if (fd == S.listenfd) {
+                accept_clients();
+                continue;
+            }
+            /* Always re-look-up by fd: a previous event in this batch may have
+             * closed the connection. */
+            c = S.conns[fd];
+            if (!c) continue;
+            if (ev & EPOLLIN) on_readable(c);
+            c = S.conns[fd];
+            if (c && (ev & EPOLLOUT)) {
+                flush_conn(c);
+                if (c->dead) {
+                    close_conn(c);
+                    continue;
+                }
+            }
+            c = S.conns[fd];
+            if (c && (ev & (EPOLLERR | EPOLLHUP)) && !(ev & EPOLLIN)) close_conn(c);
+        }
+        if (mono_ms() - last_expire >= 100) {
+            active_expire();
+            last_expire = mono_ms();
+        }
+        before_sleep();
+    }
+}
+
+static void on_signal(int sig) { (void)sig; S.stop = 1; }
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s [-p port] [-b bind_addr] [-a aof_file|none] [-f always|everysec|no]\n"
+            "  defaults: -p 6399 -b 127.0.0.1 -a minikv.aof -f everysec\n", prog);
+    exit(2);
+}
+
+int main(int argc, char **argv) {
+    const char *bind_addr = "127.0.0.1";
+    const char *aof = "minikv.aof";
+    struct sockaddr_in sa;
+    struct sigaction act;
+    struct rlimit rl;
+    struct epoll_event ev = {.events = EPOLLIN};
+    int opt, one = 1;
+
+    while ((opt = getopt(argc, argv, "p:b:a:f:h")) != -1) {
+        switch (opt) {
+        case 'p': S.port = atoi(optarg); break;
+        case 'b': bind_addr = optarg; break;
+        case 'a': aof = optarg; break;
+        case 'f':
+            if (!strcmp(optarg, "always")) S.fsync_policy = FSYNC_ALWAYS;
+            else if (!strcmp(optarg, "everysec")) S.fsync_policy = FSYNC_EVERYSEC;
+            else if (!strcmp(optarg, "no")) S.fsync_policy = FSYNC_NO;
+            else usage(argv[0]);
+            break;
+        default: usage(argv[0]);
+        }
+    }
+    if (S.port <= 0 || S.port > 65535) usage(argv[0]);
+
+    memset(&act, 0, sizeof act);
+    act.sa_handler = on_signal; /* no SA_RESTART: epoll_wait must see EINTR */
+    sigaction(SIGINT, &act, NULL);
+    sigaction(SIGTERM, &act, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+
+    S.db = dict_new();
+    S.expires = dict_new();
+    if (!S.db || !S.expires) DIE("out of memory");
+    S.start_ms = wall_ms();
+    S.now = S.start_ms;
+
+    if (strcmp(aof, "none") != 0) {
+        S.aof_path = strdup(aof);
+        aof_load(aof);
+        S.aof_fd = open(aof, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+        if (S.aof_fd < 0) DIE("cannot open AOF %s: %s", aof, strerror(errno));
+        S.last_fsync = mono_ms();
+    }
+
+    S.listenfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (S.listenfd < 0) DIE("socket: %s", strerror(errno));
+    setsockopt(S.listenfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)S.port);
+    if (inet_pton(AF_INET, bind_addr, &sa.sin_addr) != 1) DIE("bad bind address %s", bind_addr);
+    if (bind(S.listenfd, (struct sockaddr *)&sa, sizeof sa) < 0) DIE("bind: %s", strerror(errno));
+    if (listen(S.listenfd, 511) < 0) DIE("listen: %s", strerror(errno));
+
+    S.epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (S.epfd < 0) DIE("epoll_create1: %s", strerror(errno));
+    ev.data.fd = S.listenfd;
+    if (epoll_ctl(S.epfd, EPOLL_CTL_ADD, S.listenfd, &ev) < 0) DIE("epoll_ctl: %s", strerror(errno));
+
+    LOG("MiniKV " VERSION " listening on %s:%d (aof=%s, fsync=%s)", bind_addr, S.port,
+        S.aof_fd >= 0 ? aof : "off",
+        S.fsync_policy == FSYNC_ALWAYS ? "always" : S.fsync_policy == FSYNC_EVERYSEC ? "everysec" : "no");
+
+    event_loop();
+
+    LOG("shutting down...");
+    aof_flush(1);
+    if (S.aof_fd >= 0) close(S.aof_fd);
+    for (size_t i = 0; i < S.conns_cap; i++)
+        if (S.conns && S.conns[i]) close_conn(S.conns[i]);
+    close(S.listenfd);
+    close(S.epfd);
+    dict_free(S.db);
+    dict_free(S.expires);
+    free(S.conns);
+    free(S.pending);
+    free(S.aof_buf);
+    free(S.aof_path);
+    return 0;
+}
